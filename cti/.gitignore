@@ -1,0 +1,13 @@
+build/*
+traces/*
+.trace
+.coverage*
+Pub.*.toml
+
+build/
+encrypted_payloads/
+encrypted_responses/
+encrypted_delegate_payload/
+bench_outputs/
+Pub.local.toml
+.DS_Store
