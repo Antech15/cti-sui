@@ -131,6 +131,16 @@ def evaluate_acmp(acmp: str, credentials: str) -> bool:
         return False
     return credentials == acmp or credentials.lower() == "andres"
 
+def _hash_to_hex(b: bytes) -> str:
+    return b.hex()
+
+def _print_hash_comparison(label: str, local_hash: bytes, on_chain_hash_list: List[int]):
+    chain_bytes = bytes(on_chain_hash_list)
+    print(f"\n🔎 Hash verification ({label})")
+    print("Local  SHA-256(CTI|nonce):", _hash_to_hex(local_hash))
+    print("On-chain CTI hash        :", _hash_to_hex(chain_bytes))
+    print("Match?                  :", "✅ YES" if local_hash == chain_bytes else "❌ NO")
+
 
 # ---------------------------- IPFS daemon ----------------------------
 
@@ -728,15 +738,16 @@ class CTISharingProgram:
             return
 
         local_hash = hashlib.sha256(plaintext).digest()
-        if isinstance(on_chain_hash, list):
-            chain_bytes = bytes(on_chain_hash)
-        else:
+
+        if not isinstance(on_chain_hash, list):
             print("Unexpected hash format:", type(on_chain_hash), on_chain_hash)
             print("Fields available:", list(fields.keys()))
             print()
             return
 
-        if local_hash != chain_bytes:
+        _print_hash_comparison("delegate Step 3", local_hash, on_chain_hash)
+
+        if local_hash != bytes(on_chain_hash):
             print("❌ Verification FAILED: hash mismatch.\n")
             return
 
@@ -1189,15 +1200,15 @@ class CTISharingProgram:
             return
 
         on_chain_hash = cti_fields.get("cti_hash")
-        if isinstance(on_chain_hash, list):
-            chain_bytes = bytes(on_chain_hash)
-        else:
+        if not isinstance(on_chain_hash, list):
             print("Unexpected CTI hash format:", type(on_chain_hash), on_chain_hash)
             print("CTI fields available:", list(cti_fields.keys()))
             print()
             return
 
-        if local_hash != chain_bytes:
+        _print_hash_comparison("consumer Steps 11/12", local_hash, on_chain_hash)
+
+        if local_hash != bytes(on_chain_hash):
             print("❌ Verification FAILED: hash mismatch.\n")
             return
 
@@ -1858,10 +1869,10 @@ class CTISharingProgram:
             print("2) Retrieve CTI (delegate) (Step 3)")
             print("3) Request CTI (consumer) (Steps 4 & 5)")
             print("4) Submit Credentials (consumer) (Step 6)")
-            print("5) Delegate control + respond (Steps 7, 8, 9)")
+            print("5) Delegate control + respond (Steps 7, 8, 9 & 10)")
             print("6) Consumer fetch + decrypt + verify (Steps 11 & 12)")
             print("7) Become delegate (consumer) (Step 13)")
-            print("8) Benchmark + generate Table/Figs (paper-style)")
+            print("8) Benchmark + generate Table/Figs")
             print("0) Exit")
             choice = input("> ").strip()
 
