@@ -22,6 +22,13 @@ from cryptography.hazmat.backends import default_backend
 from cryptography.fernet import Fernet
 
 
+from concurrent.futures import ThreadPoolExecutor
+import threading
+import shutil
+import tempfile
+import requests
+
+
 # ---------------------------- crypto helpers ----------------------------
 
 def _hybrid_encrypt(public_key, payload: bytes) -> str:
@@ -282,6 +289,20 @@ class CTISharingProgram:
         self.ipfs = IPFSDaemon()
         self.ipfs_enabled = False
 
+        # ---- Benchmark / CLI concurrency fixes ----
+        # Base config dir the user already has (keystore + client.yaml)
+        self._base_sui_config_dir = os.environ.get(
+            "SUI_CONFIG_DIR",
+            os.path.expanduser("~/.sui/sui_config"),
+        )
+
+        # Per-thread Sui config dirs so threads do NOT fight over "active address"
+        self._thread_local = threading.local()
+        self._tmp_config_dirs: List[str] = []
+
+        # Used to serialize *initial* config bootstrap per thread
+        self._config_bootstrap_lock = threading.Lock()
+
     # ---------------- localnet ----------------
 
     def start_localnet(self) -> bool:
@@ -440,6 +461,69 @@ class CTISharingProgram:
 
     def fetch_fields_any_object(self, object_id: str) -> dict:
         return self.fetch_object_fields(object_id)
+    
+    def _thread_config_dir(self) -> str:
+        """
+        Each worker thread gets its own SUI_CONFIG_DIR (a copy of base config),
+        so 'sui client switch' in that thread doesn't race other threads.
+        """
+        cfg = getattr(self._thread_local, "sui_config_dir", None)
+        if cfg:
+            return cfg
+
+        with self._config_bootstrap_lock:
+            # Re-check after acquiring lock
+            cfg = getattr(self._thread_local, "sui_config_dir", None)
+            if cfg:
+                return cfg
+
+            # Create temp config dir and copy base config into it
+            tmp = tempfile.mkdtemp(prefix="sui_cfg_")
+            self._tmp_config_dirs.append(tmp)
+
+            if os.path.isdir(self._base_sui_config_dir):
+                shutil.copytree(self._base_sui_config_dir, tmp, dirs_exist_ok=True)
+            else:
+                # If base doesn't exist, still create dir so Sui can initialize if needed
+                os.makedirs(tmp, exist_ok=True)
+
+            self._thread_local.sui_config_dir = tmp
+            return tmp
+
+
+    def _sui_env(self) -> dict:
+        env = os.environ.copy()
+        env["SUI_CONFIG_DIR"] = self._thread_config_dir()
+        return env
+
+
+    def _sui_run(self, args: List[str]) -> subprocess.CompletedProcess:
+        """
+        Run sui CLI under this thread's isolated config dir.
+        """
+        return subprocess.run(args, capture_output=True, text=True, env=self._sui_env())
+
+
+    def _sui_switch_in_thread(self, address: str) -> None:
+        """
+        One-time or occasional switch inside THIS thread only.
+        (Because config dir is thread-local, this won't affect other threads.)
+        """
+        r = self._sui_run(["sui", "client", "switch", "--address", address])
+        if r.returncode != 0:
+            raise RuntimeError(r.stderr or r.stdout or "sui client switch failed")
+
+
+    def cleanup_thread_configs(self):
+        """
+        Optional cleanup at program exit.
+        """
+        for d in self._tmp_config_dirs:
+            try:
+                shutil.rmtree(d, ignore_errors=True)
+            except Exception:
+                pass
+        self._tmp_config_dirs.clear()
 
     # ---------------- setup accounts ----------------
 
@@ -1356,14 +1440,30 @@ class CTISharingProgram:
 
     # ---------------- benchmark: low-level json call + gas ----------------
 
-    def _sui_call_json(self, args_list: List[str]) -> Tuple[Optional[dict], GasSummary, str]:
-        r = subprocess.run(args_list, capture_output=True, text=True)
-        out = r.stdout or ""
+    def _sui_call_json(self, args_list: List[str], *, address: Optional[str] = None) -> Tuple[Optional[dict], GasSummary, str]:
+        """
+        Run a sui command that returns JSON.
+        If address is provided, we switch in THIS THREAD only (thread-local config dir).
+        """
+        if address:
+            self._sui_switch_in_thread(address)
+
+        r = self._sui_run(args_list)
+        out = (r.stdout or "") + (r.stderr or "")
+
+        # Try direct JSON parse
         try:
-            data = json.loads(out)
+            data = json.loads(r.stdout)
+            return data, _parse_gas_summary(data), out
         except Exception:
-            return None, GasSummary(), out
-        return data, _parse_gas_summary(data), out
+            pass
+
+        # Try extract JSON from mixed output
+        data = self._extract_json_from_mixed_output(out)
+        if data:
+            return data, _parse_gas_summary(data), out
+
+        return None, GasSummary(), out
 
     # ---------------- benchmark: noninteractive primitives ----------------
 
@@ -1395,25 +1495,24 @@ class CTISharingProgram:
         acmp_arg = str(int(acmp_num))
         encrypted_refs_arg = "[" + ",".join(json.dumps(s) for s in encrypted_refs) + "]" if encrypted_refs else "[]"
 
-        self.switch_account(self.accounts["producer"].address)
+        producer_addr = self.accounts["producer"].address
 
-        data, gas, _ = self._sui_call_json(
-            [
-                "sui", "client", "call",
-                "--package", self.package_id,
-                "--module", "cti",
-                "--function", "share_cti",
-                "--args",
-                self.registry_id,
-                hash_arg,
-                acmp_arg,
-                delegates_arg,
-                encrypted_refs_arg,
-                "--json",
-            ]
-        )
+        data, gas, raw = self._sui_call_json([
+            "sui", "client", "call",
+            "--package", self.package_id,
+            "--module", "cti",
+            "--function", "share_cti",
+            "--args",
+            self.registry_id,
+            hash_arg,
+            acmp_arg,
+            delegates_arg,
+            encrypted_refs_arg,
+            "--json",
+        ], address=producer_addr)
+
         if not data:
-            raise RuntimeError("share_cti did not return JSON")
+            raise RuntimeError("share_cti did not return JSON:\n" + raw[:1200])
 
         cti_id = None
         for change in data.get("objectChanges", []):
@@ -1427,32 +1526,27 @@ class CTISharingProgram:
 
     def _request_and_credentials(self, cti_id: str, credentials_text: str = "andres") -> Tuple[str, str, GasSummary, GasSummary]:
         consumer_addr = self.accounts["consumer"].address
-        if not self.switch_account(consumer_addr):
-            raise RuntimeError("Failed to switch to consumer account")
 
-        data4, gas4, raw4 = self._sui_call_json(
-            [
-                "sui", "client", "call",
-                "--package", self.package_id,
-                "--module", "cti",
-                "--function", "request_cti",
-                "--args", cti_id,
-                "--json",
-            ]
+        # -------- Step 4: request_cti (RPC) --------
+        data4, gas4 = self._rpc_move_call_commit(
+            signer=consumer_addr,
+            package_id=self.package_id,
+            module="cti",
+            function="request_cti",
+            args=[cti_id],
+            gas_budget="100000000",
         )
-        if not data4:
-            raise RuntimeError(f"request_cti did not return JSON: {raw4[:200]}")
 
         request_obj_id = None
-        for change in data4.get("objectChanges", []):
+        for change in data4.get("objectChanges", []) or []:
             if change.get("type") == "created" and (change.get("objectType") or "").endswith("::CTIRequest"):
                 request_obj_id = change.get("objectId")
                 break
         if not request_obj_id:
-            raise RuntimeError("Could not extract CTIRequest objectId")
+            raise RuntimeError("Could not extract CTIRequest objectId from RPC request_cti")
 
         assigned_delegate = None
-        for ev in data4.get("events", []):
+        for ev in data4.get("events", []) or []:
             et = ev.get("type") or ev.get("eventType") or ""
             if et.endswith("::CTIRequested"):
                 parsed = ev.get("parsedJson") or {}
@@ -1460,6 +1554,7 @@ class CTISharingProgram:
                 break
 
         if not assigned_delegate:
+            # NOTE: this read still uses CLI in your code; OK for now.
             req_fields = self.fetch_object_fields(request_obj_id)
             assigned_delegate = _unwrap_sui_value(req_fields.get("assigned_delegate"))
 
@@ -1477,24 +1572,30 @@ class CTISharingProgram:
         enc_cred_json = encrypt_for_public_key(delegate_acct.public_key, credentials_text.encode("utf-8"))
         enc_arg = json.dumps(enc_cred_json)
 
-        data6, gas6, raw6 = self._sui_call_json(
-            [
-                "sui", "client", "call",
-                "--package", self.package_id,
-                "--module", "cti",
-                "--function", "credentials_cti",
-                "--args",
-                request_obj_id,
-                enc_arg,
-                "--json",
-            ]
+        # -------- Step 6: credentials_cti (RPC) --------
+        data6, gas6 = self._rpc_move_call_commit(
+            signer=consumer_addr,
+            package_id=self.package_id,
+            module="cti",
+            function="credentials_cti",
+            args=[request_obj_id, enc_arg],
+            gas_budget="100000000",
         )
-        if not data6:
-            raise RuntimeError(f"credentials_cti did not return JSON: {raw6[:200]}")
+
+        # Optional sanity check:
+        if not isinstance(data6, dict) or not data6.get("effects"):
+            raise RuntimeError("credentials_cti RPC execution returned unexpected response")
+        
+        t0 = time.time()
+        for i in range(10):
+            req_id, assigned, g4, g6 = self._request_and_credentials(cti_id, "andres")
+        dt = time.time() - t0
+        print("10x _request_and_credentials took:", dt, "sec")
 
         return request_obj_id, assigned_delegate, gas4, gas6
 
     def _delegate_respond_noninteractive(self, request_obj_id: str, simulate_work_hashes: int = 0) -> GasSummary:
+        # Read request state (object reads don't require sender, but still go through thread config)
         req_fields = self.fetch_object_fields(request_obj_id)
         assigned_delegate = _unwrap_sui_value(req_fields.get("assigned_delegate"))
         consumer_addr = _unwrap_sui_value(req_fields.get("consumer"))
@@ -1512,9 +1613,6 @@ class CTISharingProgram:
                 break
         if not delegate_name:
             raise RuntimeError("Assigned delegate not found locally")
-
-        if not self.switch_account(self.accounts[delegate_name].address):
-            raise RuntimeError("Failed to switch to delegate account")
 
         creds_plain = self.accounts[delegate_name].decrypt_payload(encrypted_credentials).decode("utf-8", errors="replace")
 
@@ -1539,8 +1637,13 @@ class CTISharingProgram:
             raise RuntimeError("Consumer account not found locally")
 
         encrypted_response_json = encrypt_for_public_key(consumer_account.public_key, cti_plain)
+
+        # IMPORTANT: keep benchmark stable by forcing file:// pointers.
+        # If you want to fully remove IPFS overhead, ensure ipfs_enabled=False during benchmarking.
         response_ref = self.upload_response_to_ipfs(encrypted_response_json, request_obj_id)
         ref_arg = json.dumps(response_ref)
+
+        delegate_addr = self.accounts[delegate_name].address
 
         data, gas, raw = self._sui_call_json(
             [
@@ -1548,20 +1651,17 @@ class CTISharingProgram:
                 "--package", self.package_id,
                 "--module", "cti",
                 "--function", "response_cti",
-                "--args",
-                request_obj_id,
-                ref_arg,
+                "--args", request_obj_id, ref_arg,
                 "--json",
-            ]
+            ],
+            address=delegate_addr
         )
         if not data:
-            raise RuntimeError(f"response_cti did not return JSON: {raw[:200]}")
+            raise RuntimeError("response_cti did not return JSON:\n" + raw[:1200])
+
         return gas
 
     def _consumer_verify_noninteractive(self, request_obj_id: str) -> bool:
-        consumer_addr = self.accounts["consumer"].address
-        self.switch_account(consumer_addr)
-
         req_fields = self.fetch_object_fields(request_obj_id)
         if not _unwrap_sui_value(req_fields.get("response_provided")):
             return False
@@ -1602,7 +1702,6 @@ class CTISharingProgram:
 
     def _add_delegate_noninteractive(self, cti_id: str, request_obj_id: str) -> GasSummary:
         consumer_addr = self.accounts["consumer"].address
-        self.switch_account(consumer_addr)
 
         req_fields = self.fetch_object_fields(request_obj_id)
         resp_nft_id = _unwrap_option_id(req_fields.get("encrypted_response_nft_id"))
@@ -1635,15 +1734,13 @@ class CTISharingProgram:
                 "--package", self.package_id,
                 "--module", "cti",
                 "--function", "add_delegate",
-                "--args",
-                cti_id,
-                consumer_addr,
-                ref_arg,
+                "--args", cti_id, consumer_addr, ref_arg,
                 "--json",
-            ]
+            ],
+            address=consumer_addr
         )
         if not data:
-            raise RuntimeError(f"add_delegate did not return JSON: {raw[:200]}")
+            raise RuntimeError("add_delegate did not return JSON:\n" + raw[:1200])
         return gas
 
     # ---------------- Option 8: paper-style outputs ----------------
@@ -1748,6 +1845,9 @@ class CTISharingProgram:
     def run_benchmarks_paper_style(self):
         os.makedirs("bench_outputs", exist_ok=True)
 
+         # Benchmark should NOT include IPFS overhead in the hot path
+        self.ipfs_enabled = False
+
         try:
             iterations = int(input("Iterations per (delegates,rps) point (paper used 100): ").strip() or "30")
         except ValueError:
@@ -1769,7 +1869,9 @@ class CTISharingProgram:
 
         # ---- COSTS (DN=0..4) ----
         cost_rows = []
+        print("\n--- Computing gas cost rows (DN=0..4) ---")
         for dn in range(0, 5):
+            print(f"Creating cost row for delegates={dn}")
             cti_id, gas_share = self._create_cti_noninteractive(dn, payload, acmp_num=2)
             row = {
                 "delegate_count": dn,
@@ -1792,30 +1894,127 @@ class CTISharingProgram:
 
         # ---- FIG6 points (DN=1..4, rps=1..max) ----
         fig6_points: Dict[Tuple[int, int], List[float]] = {}
+
         for dn in range(1, 5):
             cti_id, _ = self._create_cti_noninteractive(dn, payload, acmp_num=2)
+
             for rps in range(1, max_rps + 1):
                 rates = []
+
                 for _it in range(iterations):
                     start = time.time()
                     end = start + seconds
-                    responded = 0
                     next_tick = start
-                    while time.time() < end:
-                        now = time.time()
-                        if now < next_tick:
-                            time.sleep(min(0.005, next_tick - now))
-                            continue
-                        next_tick += 1.0 / rps
-                        try:
-                            req_id, _, _, _ = self._request_and_credentials(cti_id, credentials_text="andres")
-                            self._delegate_respond_noninteractive(req_id, simulate_work_hashes=simulate_work)
-                            if self._consumer_verify_noninteractive(req_id):
-                                responded += 1
-                        except Exception:
-                            pass
+
+                    attempted = ok = fail_req = fail_resp = fail_verify = 0
+
+                    with ThreadPoolExecutor(max_workers=dn) as ex_resp, ThreadPoolExecutor(max_workers=1) as ex_ver:
+                        resp_futures: List[Tuple[object, str]] = []      # (future, request_id)
+                        ver_futures: List[Tuple[object, str]] = []       # (future, request_id)
+
+                        while time.time() < end:
+                            now = time.time()
+                            if now < next_tick:
+                                time.sleep(min(0.005, next_tick - now))
+                                continue
+                            next_tick += 1.0 / rps
+
+                            # Step 4 + 6: create request & submit credentials (serial, consumer)
+                            attempted += 1
+                            try:
+                                req_id, _, _, _ = self._request_and_credentials(cti_id, credentials_text="andres")
+                            except Exception:
+                                fail_req += 1
+                                continue
+
+                            # Step 10: delegate response concurrently
+                            fut = ex_resp.submit(
+                                self._delegate_respond_noninteractive,
+                                req_id,
+                                simulate_work_hashes=simulate_work
+                            )
+                            resp_futures.append((fut, req_id))
+
+                            # 1) Harvest finished RESPONSES without blocking
+                            still_pending_resp: List[Tuple[object, str]] = []
+                            for f, rid in resp_futures:
+                                if not f.done():
+                                    still_pending_resp.append((f, rid))
+                                    continue
+
+                                try:
+                                    _ = f.result()
+                                except Exception:
+                                    fail_resp += 1
+                                    continue
+
+                                # Steps 11/12: verify asynchronously (serial executor by default)
+                                vf = ex_ver.submit(self._consumer_verify_noninteractive, rid)
+                                ver_futures.append((vf, rid))
+
+                            resp_futures = still_pending_resp
+
+                            # 2) Harvest finished VERIFICATIONS without blocking
+                            still_pending_ver: List[Tuple[object, str]] = []
+                            for vf, rid in ver_futures:
+                                if not vf.done():
+                                    still_pending_ver.append((vf, rid))
+                                    continue
+
+                                try:
+                                    if vf.result():
+                                        ok += 1
+                                    else:
+                                        fail_verify += 1
+                                except Exception:
+                                    fail_verify += 1
+
+                            ver_futures = still_pending_ver
+
+                        # Grace period: collect late completions (responses + verifications)
+                        grace_end = time.time() + 1.0
+                        while (resp_futures or ver_futures) and time.time() < grace_end:
+                            # Harvest responses -> enqueue verifications
+                            still_pending_resp = []
+                            for f, rid in resp_futures:
+                                if not f.done():
+                                    still_pending_resp.append((f, rid))
+                                    continue
+                                try:
+                                    _ = f.result()
+                                except Exception:
+                                    fail_resp += 1
+                                    continue
+                                vf = ex_ver.submit(self._consumer_verify_noninteractive, rid)
+                                ver_futures.append((vf, rid))
+                            resp_futures = still_pending_resp
+
+                            # Harvest verifications
+                            still_pending_ver = []
+                            for vf, rid in ver_futures:
+                                if not vf.done():
+                                    still_pending_ver.append((vf, rid))
+                                    continue
+                                try:
+                                    if vf.result():
+                                        ok += 1
+                                    else:
+                                        fail_verify += 1
+                                except Exception:
+                                    fail_verify += 1
+                            ver_futures = still_pending_ver
+
+                            time.sleep(0.02)
+
                     duration = max(0.0001, time.time() - start)
-                    rates.append(responded / duration)
+                    rate = ok / duration
+
+                    # optional debug print per iteration window:
+                    print(f"[dn={dn} rps={rps} it={_it}] attempted={attempted} ok={ok} "
+                        f"fail_req={fail_req} fail_resp={fail_resp} fail_verify={fail_verify} "
+                        f"resp/s={rate:.2f}")
+
+                    rates.append(rate)
 
                 fig6_points[(dn, rps)] = rates
                 m, s = _mean_std(rates)
@@ -1842,11 +2041,148 @@ class CTISharingProgram:
         print("  bench_outputs/fig7.png")
         print("  bench_outputs/raw_results.json\n")
 
+    def _rpc_call(self, method: str, params: list):
+        payload = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": method,
+            "params": params
+        }
+
+        r = requests.post(
+            "http://127.0.0.1:9000",
+            json=payload,
+            timeout=10
+        )
+        r.raise_for_status()
+        result = r.json()
+
+        if "error" in result:
+            raise RuntimeError(result["error"])
+
+        return result["result"]
+    
+    def _sign_txbytes_with_keytool(self, address: str, tx_bytes_b64: str) -> str:
+        """
+        Returns a Sui signature string for sui_executeTransactionBlock.
+        Uses local keystore via `sui keytool sign --json`.
+        """
+        # Important: keytool uses your wallet/keystore (SUI_CONFIG_DIR).
+        # If you're using thread-local config dirs, you can pass env=self._sui_env().
+        r = subprocess.run(
+            ["sui", "keytool", "sign", "--address", address, "--data", tx_bytes_b64, "--json"],
+            capture_output=True,
+            text=True,
+            env=os.environ.copy(),  # or env=self._sui_env() if you want thread-local here too
+        )
+        if r.returncode != 0:
+            raise RuntimeError(r.stderr or r.stdout or "sui keytool sign failed")
+
+        try:
+            j = json.loads(r.stdout)
+        except Exception:
+            # keytool sometimes prints pretty tables without --json; but we used --json.
+            raise RuntimeError("Failed to parse keytool sign JSON:\n" + (r.stdout or "")[:800])
+
+        sig = j.get("suiSignature")
+        if not isinstance(sig, str) or not sig:
+            raise RuntimeError("keytool sign did not return suiSignature:\n" + r.stdout[:800])
+        return sig
+    
+    def _rpc_unsafe_move_call(
+        self,
+        signer: str,
+        package_id: str,
+        module: str,
+        function: str,
+        type_arguments: Optional[List[str]],
+        arguments: List[object],
+        gas_object: Optional[str] = None,
+        gas_budget: str = "100000000",
+    ):
+        """
+        Returns TransactionBlockBytes (dict) with txBytes (base64), gas, inputObjects.
+        Uses unsafe_moveCall builder on the node. :contentReference[oaicite:4]{index=4}
+        """
+        # Param order matches Sui JSON-RPC unsafe_moveCall: :contentReference[oaicite:5]{index=5}
+        # signer, package_object_id, module, function, type_arguments, arguments, gas, gas_budget, execution_mode
+        return self._rpc_call(
+            "unsafe_moveCall",
+            [
+                signer,
+                package_id,
+                module,
+                function,
+                type_arguments or [],
+                arguments,
+                gas_object,      # None => node auto-select gas
+                gas_budget,
+                None,            # execution_mode None => Commit by default
+            ],
+        )
+    
+    def _rpc_execute_tx(self, tx_bytes_b64: str, signature: str) -> dict:
+        """
+        Executes txBytes with signature via sui_executeTransactionBlock.
+        Returns the transaction response including effects/objectChanges/events if requested.
+        :contentReference[oaicite:6]{index=6}
+        """
+        options = {
+            "showEffects": True,
+            "showObjectChanges": True,
+            "showEvents": True,
+        }
+        return self._rpc_call(
+            "sui_executeTransactionBlock",
+            [
+                tx_bytes_b64,
+                [signature],
+                options,
+                "WaitForLocalExecution",
+            ],
+        )
+    
+    def _rpc_move_call_commit(
+        self,
+        signer: str,
+        package_id: str,
+        module: str,
+        function: str,
+        args: List[object],
+        type_args: Optional[List[str]] = None,
+        gas_object: Optional[str] = None,
+        gas_budget: str = "100000000",
+    ) -> Tuple[dict, GasSummary]:
+        """
+        1) unsafe_moveCall -> txBytes
+        2) keytool sign    -> suiSignature
+        3) execute         -> tx response
+        """
+        tb = self._rpc_unsafe_move_call(
+            signer=signer,
+            package_id=package_id,
+            module=module,
+            function=function,
+            type_arguments=type_args,
+            arguments=args,
+            gas_object=gas_object,
+            gas_budget=gas_budget,
+        )
+        txb = tb.get("txBytes")
+        if not isinstance(txb, str) or not txb:
+            raise RuntimeError("unsafe_moveCall did not return txBytes:\n" + json.dumps(tb, indent=2)[:800])
+
+        sig = self._sign_txbytes_with_keytool(signer, txb)
+        resp = self._rpc_execute_tx(txb, sig)
+
+        return resp, _parse_gas_summary(resp)
+
     # ---------------- run ----------------
 
     def run(self):
         atexit.register(self.stop_localnet)
         atexit.register(self.stop_ipfs)
+        atexit.register(self.cleanup_thread_configs)
 
         if not self.start_localnet():
             return
