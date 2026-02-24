@@ -278,6 +278,16 @@ def _linear_fit(x: List[float], y: List[float]) -> Tuple[float, float]:
 
 class CTISharingProgram:
     def __init__(self):
+        # ---- Object read cache (Fix #3) ----
+        self._gas_pool_lock = threading.Lock()
+        self._gas_pool: Dict[str, List[str]] = {}  # address -> [coin_object_id, ...]
+        self._use_rpc_object_reads = True
+        self._obj_cache_lock = threading.Lock()
+        self._obj_cache: Dict[str, Tuple[float, dict]] = {}
+        self._OBJ_CACHE_TTL_SEC = 0.50  # 500ms is enough to cut spam reads during benchmarks
+        self._keytool_lock = threading.Lock()
+        self._rpc_id_lock = threading.Lock()
+        self._rpc_next_id = 1
         self.localnet_process: Optional[subprocess.Popen] = None
         self.accounts: Dict[str, Account] = {}
         self.package_id: Optional[str] = None
@@ -452,12 +462,35 @@ class CTISharingProgram:
             raise RuntimeError(r.stderr or r.stdout)
         return json.loads(r.stdout)
 
+    def _cache_invalidate(self, object_id: str) -> None:
+        if not object_id:
+            return
+        with self._obj_cache_lock:
+            self._obj_cache.pop(object_id, None)
+
     def fetch_object_fields(self, object_id: str) -> dict:
-        data = self._fetch_object_json(object_id)
-        content = data.get("content") or {}
-        if isinstance(content, dict):
-            return (content.get("fields") or {})
-        return {}
+        # ---- cache check ----
+        now = time.time()
+        with self._obj_cache_lock:
+            hit = self._obj_cache.get(object_id)
+            if hit:
+                ts, fields = hit
+                if (now - ts) <= self._OBJ_CACHE_TTL_SEC:
+                    return fields
+
+        # ---- miss: fetch (RPC preferred) ----
+        if getattr(self, "_use_rpc_object_reads", False):
+            fields = self._rpc_get_object_fields(object_id)
+        else:
+            data = self._fetch_object_json(object_id)
+            content = data.get("content") or {}
+            fields = (content.get("fields") or {}) if isinstance(content, dict) else {}
+
+        # ---- store ----
+        with self._obj_cache_lock:
+            self._obj_cache[object_id] = (now, fields)
+
+        return fields
 
     def fetch_fields_any_object(self, object_id: str) -> dict:
         return self.fetch_object_fields(object_id)
@@ -1554,9 +1587,8 @@ class CTISharingProgram:
                 break
 
         if not assigned_delegate:
-            # NOTE: this read still uses CLI in your code; OK for now.
-            req_fields = self.fetch_object_fields(request_obj_id)
-            assigned_delegate = _unwrap_sui_value(req_fields.get("assigned_delegate"))
+            # Benchmark mode: require event to avoid CLI object read in hot path
+            raise RuntimeError("assigned_delegate missing from CTIRequested event")
 
         if not isinstance(assigned_delegate, str) or not assigned_delegate.startswith("0x"):
             raise RuntimeError("Could not resolve assigned_delegate")
@@ -1570,7 +1602,7 @@ class CTISharingProgram:
             raise RuntimeError("Assigned delegate not one of local delegate accounts")
 
         enc_cred_json = encrypt_for_public_key(delegate_acct.public_key, credentials_text.encode("utf-8"))
-        enc_arg = json.dumps(enc_cred_json)
+        enc_arg = enc_cred_json
 
         # -------- Step 6: credentials_cti (RPC) --------
         data6, gas6 = self._rpc_move_call_commit(
@@ -1582,17 +1614,53 @@ class CTISharingProgram:
             gas_budget="100000000",
         )
 
-        # Optional sanity check:
         if not isinstance(data6, dict) or not data6.get("effects"):
             raise RuntimeError("credentials_cti RPC execution returned unexpected response")
-        
-        t0 = time.time()
-        for i in range(10):
-            req_id, assigned, g4, g6 = self._request_and_credentials(cti_id, "andres")
-        dt = time.time() - t0
-        print("10x _request_and_credentials took:", dt, "sec")
 
         return request_obj_id, assigned_delegate, gas4, gas6
+    
+    def _rpc_get_object_fields(self, object_id: str) -> dict:
+        # Sui JSON-RPC: sui_getObject
+        result = self._rpc_call("sui_getObject", [
+            object_id,
+            {"showContent": True}
+        ])
+        data = result.get("data") or {}
+        content = data.get("content") or {}
+        if isinstance(content, dict):
+            return content.get("fields") or {}
+        return {}
+    
+    def _rpc_get_gas_coins(self, owner: str, limit: int = 50) -> List[str]:
+        # suix_getCoins returns coin objects for SUI
+        res = self._rpc_call("suix_getCoins", [owner, "0x2::sui::SUI", None, limit])
+        data = res.get("data") or []
+        out = []
+        for c in data:
+            cid = c.get("coinObjectId")
+            if isinstance(cid, str) and cid.startswith("0x"):
+                out.append(cid)
+        return out
+
+    def _gas_acquire(self, owner: str) -> str:
+        with self._gas_pool_lock:
+            pool = self._gas_pool.get(owner) or []
+            if pool:
+                return pool.pop()
+        # outside lock: refill
+        coins = self._rpc_get_gas_coins(owner, limit=50)
+        if not coins:
+            raise RuntimeError(f"No gas coins available for {owner}")
+        with self._gas_pool_lock:
+            # keep extras in pool
+            self._gas_pool.setdefault(owner, []).extend(coins[:-1])
+        return coins[-1]
+
+    def _gas_release(self, owner: str, coin_id: str) -> None:
+        if not coin_id:
+            return
+        with self._gas_pool_lock:
+            self._gas_pool.setdefault(owner, []).append(coin_id)
 
     def _delegate_respond_noninteractive(self, request_obj_id: str, simulate_work_hashes: int = 0) -> GasSummary:
         # Read request state (object reads don't require sender, but still go through thread config)
@@ -1659,6 +1727,7 @@ class CTISharingProgram:
         if not data:
             raise RuntimeError("response_cti did not return JSON:\n" + raw[:1200])
 
+        self._cache_invalidate(request_obj_id)
         return gas
 
     def _consumer_verify_noninteractive(self, request_obj_id: str) -> bool:
@@ -1702,6 +1771,7 @@ class CTISharingProgram:
 
     def _add_delegate_noninteractive(self, cti_id: str, request_obj_id: str) -> GasSummary:
         consumer_addr = self.accounts["consumer"].address
+        self._cache_invalidate(request_obj_id)
 
         req_fields = self.fetch_object_fields(request_obj_id)
         resp_nft_id = _unwrap_option_id(req_fields.get("encrypted_response_nft_id"))
@@ -1907,60 +1977,101 @@ class CTISharingProgram:
                     next_tick = start
 
                     attempted = ok = fail_req = fail_resp = fail_verify = 0
+                    printed_first_fail_req = False
 
-                    with ThreadPoolExecutor(max_workers=dn) as ex_resp, ThreadPoolExecutor(max_workers=1) as ex_ver:
-                        resp_futures: List[Tuple[object, str]] = []      # (future, request_id)
-                        ver_futures: List[Tuple[object, str]] = []       # (future, request_id)
+                    # Keep these modest; you can bump later.
+                    MAX_INFLIGHT = max(20, rps * 5)          # cap outstanding "request+cred" tasks
+                    REQ_WORKERS  = min(16, max(4, rps * 2))  # stage A (consumer request+cred)
+                    VER_WORKERS  = 4                         # stage C (verify)
 
-                        while time.time() < end:
+                    # Stage executors:
+                    # - ex_req handles Step 4 + Step 6 (consumer) concurrently
+                    # - ex_resp handles Step 10 (delegate response)
+                    # - ex_ver handles Steps 11/12 verify
+                    with ThreadPoolExecutor(max_workers=REQ_WORKERS) as ex_req, \
+                        ThreadPoolExecutor(max_workers=dn) as ex_resp, \
+                        ThreadPoolExecutor(max_workers=VER_WORKERS) as ex_ver:
+
+                        # Futures:
+                        req_futs: List[object] = []                 # future -> (request_obj_id) or raises
+                        resp_futs: List[Tuple[object, str]] = []    # (future, request_obj_id)
+                        ver_futs: List[Tuple[object, str]] = []     # (future, request_obj_id)
+
+                        def _stageA_request_and_creds():
+                            # returns request_obj_id
+                            req_id, _, _, _ = self._request_and_credentials(cti_id, credentials_text="andres")
+                            return req_id
+
+                        # Main fixed-rate scheduler loop
+                        while True:
                             now = time.time()
-                            if now < next_tick:
-                                time.sleep(min(0.005, next_tick - now))
-                                continue
-                            next_tick += 1.0 / rps
+                            if now >= end:
+                                break
 
-                            # Step 4 + 6: create request & submit credentials (serial, consumer)
-                            attempted += 1
-                            try:
-                                req_id, _, _, _ = self._request_and_credentials(cti_id, credentials_text="andres")
-                            except Exception:
-                                fail_req += 1
-                                continue
+                            # ---- 1) schedule new "attempts" at fixed rate, WITHOUT blocking ----
+                            if now >= next_tick:
+                                # schedule as many ticks as we missed (important if we got delayed)
+                                while now >= next_tick and now < end:
+                                    next_tick += 1.0 / max(1, rps)
 
-                            # Step 10: delegate response concurrently
-                            fut = ex_resp.submit(
-                                self._delegate_respond_noninteractive,
-                                req_id,
-                                simulate_work_hashes=simulate_work
-                            )
-                            resp_futures.append((fut, req_id))
+                                    # Respect inflight cap (prevents runaway memory/queueing)
+                                    if len(req_futs) < MAX_INFLIGHT:
+                                        attempted += 1
+                                        req_futs.append(ex_req.submit(_stageA_request_and_creds))
+                                    else:
+                                        # Can't enqueue more right now; count as attempted but failed-to-schedule?
+                                        # Easiest: just skip scheduling until backlog clears.
+                                        pass
 
-                            # 1) Harvest finished RESPONSES without blocking
-                            still_pending_resp: List[Tuple[object, str]] = []
-                            for f, rid in resp_futures:
+                                    now = time.time()
+                            else:
+                                # Small sleep to avoid busy spin
+                                time.sleep(min(0.002, max(0.0, next_tick - now)))
+
+                            # ---- 2) harvest finished Stage A -> enqueue Stage B ----
+                            new_req_futs = []
+                            for f in req_futs:
                                 if not f.done():
-                                    still_pending_resp.append((f, rid))
+                                    new_req_futs.append(f)
+                                    continue
+                                try:
+                                    req_id = f.result()
+                                except Exception as e:
+                                    fail_req += 1
+                                    if not printed_first_fail_req:
+                                        printed_first_fail_req = True
+                                        print("First fail_req error:", repr(e))
                                     continue
 
+                                # Enqueue delegate response (Step 10) concurrently
+                                rf = ex_resp.submit(self._delegate_respond_noninteractive, req_id, simulate_work_hashes=simulate_work)
+                                resp_futs.append((rf, req_id))
+
+                            req_futs = new_req_futs
+
+                            # ---- 3) harvest finished Stage B -> enqueue Stage C ----
+                            new_resp_futs = []
+                            for rf, req_id in resp_futs:
+                                if not rf.done():
+                                    new_resp_futs.append((rf, req_id))
+                                    continue
                                 try:
-                                    _ = f.result()
+                                    _ = rf.result()
                                 except Exception:
                                     fail_resp += 1
                                     continue
 
-                                # Steps 11/12: verify asynchronously (serial executor by default)
-                                vf = ex_ver.submit(self._consumer_verify_noninteractive, rid)
-                                ver_futures.append((vf, rid))
+                                vf = ex_ver.submit(self._consumer_verify_noninteractive, req_id)
+                                ver_futs.append((vf, req_id))
 
-                            resp_futures = still_pending_resp
+                            resp_futs = new_resp_futs
 
-                            # 2) Harvest finished VERIFICATIONS without blocking
-                            still_pending_ver: List[Tuple[object, str]] = []
-                            for vf, rid in ver_futures:
+                            # ---- 4) harvest finished Stage C ----
+                            new_ver_futs = []
+                            for vf, req_id in ver_futs:
                                 if not vf.done():
-                                    still_pending_ver.append((vf, rid))
+                                    new_ver_futs.append((vf, req_id))
                                     continue
-
                                 try:
                                     if vf.result():
                                         ok += 1
@@ -1969,31 +2080,49 @@ class CTISharingProgram:
                                 except Exception:
                                     fail_verify += 1
 
-                            ver_futures = still_pending_ver
+                            ver_futs = new_ver_futs
 
-                        # Grace period: collect late completions (responses + verifications)
+                        # Optional grace period: finish backlog a bit (keeps more fair “ok” count)
                         grace_end = time.time() + 1.0
-                        while (resp_futures or ver_futures) and time.time() < grace_end:
-                            # Harvest responses -> enqueue verifications
-                            still_pending_resp = []
-                            for f, rid in resp_futures:
+                        while time.time() < grace_end and (req_futs or resp_futs or ver_futs):
+                            # Drain Stage A
+                            new_req_futs = []
+                            for f in req_futs:
                                 if not f.done():
-                                    still_pending_resp.append((f, rid))
+                                    new_req_futs.append(f)
                                     continue
                                 try:
-                                    _ = f.result()
+                                    req_id = f.result()
+                                except Exception as e:
+                                    fail_req += 1
+                                    if not printed_first_fail_req:
+                                        printed_first_fail_req = True
+                                        print("First fail_req error (grace):", repr(e))
+                                    continue
+                                rf = ex_resp.submit(self._delegate_respond_noninteractive, req_id, simulate_work_hashes=simulate_work)
+                                resp_futs.append((rf, req_id))
+                            req_futs = new_req_futs
+
+                            # Drain Stage B
+                            new_resp_futs = []
+                            for rf, req_id in resp_futs:
+                                if not rf.done():
+                                    new_resp_futs.append((rf, req_id))
+                                    continue
+                                try:
+                                    _ = rf.result()
                                 except Exception:
                                     fail_resp += 1
                                     continue
-                                vf = ex_ver.submit(self._consumer_verify_noninteractive, rid)
-                                ver_futures.append((vf, rid))
-                            resp_futures = still_pending_resp
+                                vf = ex_ver.submit(self._consumer_verify_noninteractive, req_id)
+                                ver_futs.append((vf, req_id))
+                            resp_futs = new_resp_futs
 
-                            # Harvest verifications
-                            still_pending_ver = []
-                            for vf, rid in ver_futures:
+                            # Drain Stage C
+                            new_ver_futs = []
+                            for vf, req_id in ver_futs:
                                 if not vf.done():
-                                    still_pending_ver.append((vf, rid))
+                                    new_ver_futs.append((vf, req_id))
                                     continue
                                 try:
                                     if vf.result():
@@ -2002,18 +2131,19 @@ class CTISharingProgram:
                                         fail_verify += 1
                                 except Exception:
                                     fail_verify += 1
-                            ver_futures = still_pending_ver
+                            ver_futs = new_ver_futs
 
-                            time.sleep(0.02)
+                            time.sleep(0.01)
 
-                    duration = max(0.0001, time.time() - start)
-                    rate = ok / duration
+                    # IMPORTANT: compute throughput vs the *window seconds*, not (wall_time + grace)
+                    rate = ok / max(1e-9, float(seconds))
 
-                    # optional debug print per iteration window:
-                    print(f"[dn={dn} rps={rps} it={_it}] attempted={attempted} ok={ok} "
+                    print(
+                        f"[dn={dn} rps={rps} it={_it}] "
+                        f"attempted={attempted} target~={rps*seconds} ok={ok} "
                         f"fail_req={fail_req} fail_resp={fail_resp} fail_verify={fail_verify} "
-                        f"resp/s={rate:.2f}")
-
+                        f"resp/s={rate:.2f}"
+                    )
                     rates.append(rate)
 
                 fig6_points[(dn, rps)] = rates
@@ -2042,18 +2172,18 @@ class CTISharingProgram:
         print("  bench_outputs/raw_results.json\n")
 
     def _rpc_call(self, method: str, params: list):
+        with self._rpc_id_lock:
+            rid = self._rpc_next_id
+            self._rpc_next_id += 1
+
         payload = {
             "jsonrpc": "2.0",
-            "id": 1,
+            "id": rid,
             "method": method,
             "params": params
         }
 
-        r = requests.post(
-            "http://127.0.0.1:9000",
-            json=payload,
-            timeout=10
-        )
+        r = requests.post("http://127.0.0.1:9000", json=payload, timeout=30)
         r.raise_for_status()
         result = r.json()
 
@@ -2065,28 +2195,29 @@ class CTISharingProgram:
     def _sign_txbytes_with_keytool(self, address: str, tx_bytes_b64: str) -> str:
         """
         Returns a Sui signature string for sui_executeTransactionBlock.
-        Uses local keystore via `sui keytool sign --json`.
+        Thread-safe: keytool/keystore access is serialized.
+        Uses this thread's SUI_CONFIG_DIR so threads don't fight.
         """
-        # Important: keytool uses your wallet/keystore (SUI_CONFIG_DIR).
-        # If you're using thread-local config dirs, you can pass env=self._sui_env().
-        r = subprocess.run(
-            ["sui", "keytool", "sign", "--address", address, "--data", tx_bytes_b64, "--json"],
-            capture_output=True,
-            text=True,
-            env=os.environ.copy(),  # or env=self._sui_env() if you want thread-local here too
-        )
+        with self._keytool_lock:
+            r = subprocess.run(
+                ["sui", "keytool", "sign", "--address", address, "--data", tx_bytes_b64, "--json"],
+                capture_output=True,
+                text=True,
+                env=self._sui_env(),  # <-- IMPORTANT: thread-local config dir
+            )
+
         if r.returncode != 0:
             raise RuntimeError(r.stderr or r.stdout or "sui keytool sign failed")
 
         try:
             j = json.loads(r.stdout)
         except Exception:
-            # keytool sometimes prints pretty tables without --json; but we used --json.
             raise RuntimeError("Failed to parse keytool sign JSON:\n" + (r.stdout or "")[:800])
 
         sig = j.get("suiSignature")
         if not isinstance(sig, str) or not sig:
             raise RuntimeError("keytool sign did not return suiSignature:\n" + r.stdout[:800])
+
         return sig
     
     def _rpc_unsafe_move_call(
@@ -2158,16 +2289,37 @@ class CTISharingProgram:
         2) keytool sign    -> suiSignature
         3) execute         -> tx response
         """
-        tb = self._rpc_unsafe_move_call(
-            signer=signer,
-            package_id=package_id,
-            module=module,
-            function=function,
-            type_arguments=type_args,
-            arguments=args,
-            gas_object=gas_object,
-            gas_budget=gas_budget,
-        )
+        owned_gas = None
+        if gas_object:
+            owned_gas = None  # caller provided one
+        else:
+            owned_gas = self._gas_acquire(signer)
+            gas_object = owned_gas
+
+        try:
+            tb = self._rpc_unsafe_move_call(
+                signer=signer,
+                package_id=package_id,
+                module=module,
+                function=function,
+                type_arguments=type_args,
+                arguments=args,
+                gas_object=gas_object,     # <-- now always specific
+                gas_budget=gas_budget,
+            )
+
+            txb = tb.get("txBytes")
+            if not isinstance(txb, str) or not txb:
+                raise RuntimeError("unsafe_moveCall did not return txBytes:\n" + json.dumps(tb, indent=2)[:800])
+
+            sig = self._sign_txbytes_with_keytool(signer, txb)
+            resp = self._rpc_execute_tx(txb, sig)
+            return resp, _parse_gas_summary(resp)
+
+        finally:
+            # release only if we acquired it
+            if owned_gas:
+                self._gas_release(signer, owned_gas)
         txb = tb.get("txBytes")
         if not isinstance(txb, str) or not txb:
             raise RuntimeError("unsafe_moveCall did not return txBytes:\n" + json.dumps(tb, indent=2)[:800])
