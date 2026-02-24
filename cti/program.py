@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import atexit
 import base64
-import csv
 import hashlib
 import json
 import math
@@ -27,6 +26,8 @@ import threading
 import shutil
 import tempfile
 import requests
+from collections import deque
+from typing import Deque, Set
 
 
 # ---------------------------- crypto helpers ----------------------------
@@ -280,7 +281,15 @@ class CTISharingProgram:
     def __init__(self):
         # ---- Object read cache (Fix #3) ----
         self._gas_pool_lock = threading.Lock()
-        self._gas_pool: Dict[str, List[str]] = {}  # address -> [coin_object_id, ...]
+
+        # address -> queue of available gas coins
+        self._gas_pool: Dict[str, Deque[str]] = {}
+
+        # address -> coins currently handed out (in-flight)
+        self._gas_in_use: Dict[str, Set[str]] = {}
+
+        # address -> lock to prevent concurrent refills for the same owner
+        self._gas_refill_lock: Dict[str, threading.Lock] = {}
         self._use_rpc_object_reads = True
         self._obj_cache_lock = threading.Lock()
         self._obj_cache: Dict[str, Tuple[float, dict]] = {}
@@ -1631,39 +1640,146 @@ class CTISharingProgram:
             return content.get("fields") or {}
         return {}
     
-    def _rpc_get_gas_coins(self, owner: str, limit: int = 50) -> List[str]:
-        # suix_getCoins returns coin objects for SUI
-        res = self._rpc_call("suix_getCoins", [owner, "0x2::sui::SUI", None, limit])
-        data = res.get("data") or []
-        out = []
-        for c in data:
-            cid = c.get("coinObjectId")
-            if isinstance(cid, str) and cid.startswith("0x"):
-                out.append(cid)
+    def _rpc_get_gas_coins(self, owner: str, limit: int = 200) -> List[str]:
+        """
+        Return ALL SUI coinObjectIds for owner by paging suix_getCoins robustly.
+
+        Some nodes/localnet configs have quirky hasNextPage behavior; the most reliable
+        signal is nextCursor progression + non-empty pages.
+        """
+        out: List[str] = []
+        cursor = None
+        seen: Set[str] = set()
+
+        while True:
+            res = self._rpc_call("suix_getCoins", [owner, "0x2::sui::SUI", cursor, int(limit)])
+            data = res.get("data") or []
+
+            for c in data:
+                cid = c.get("coinObjectId")
+                if isinstance(cid, str) and cid.startswith("0x") and cid not in seen:
+                    seen.add(cid)
+                    out.append(cid)
+
+            next_cursor = res.get("nextCursor")
+
+            # Stop if there's no next cursor OR the server returns an empty page
+            # OR cursor isn't progressing (safety against infinite loops).
+            if not data:
+                break
+            if not next_cursor:
+                break
+            if next_cursor == cursor:
+                break
+
+            cursor = next_cursor
+
         return out
+    
+    def _gas_refill(self, owner: str, limit: int = 500) -> None:
+        """
+        Fetch owner's SUI coins and add any that are NOT already:
+        - in the available pool
+        - currently in use
+        This prevents duplicates across concurrent refills.
+        """
+        coins = self._rpc_get_gas_coins(owner, limit=limit)
+        if not coins:
+            return
+
+        with self._gas_pool_lock:
+            pool = self._gas_pool.setdefault(owner, deque())
+            in_use = self._gas_in_use.setdefault(owner, set())
+
+            # Build a fast "already known" set
+            known = set(pool) | set(in_use)
+
+            for c in coins:
+                if c not in known:
+                    pool.append(c)
+                    known.add(c)
 
     def _gas_acquire(self, owner: str) -> str:
+        # 1) Fast path: pop from pool
         with self._gas_pool_lock:
-            pool = self._gas_pool.get(owner) or []
+            pool = self._gas_pool.setdefault(owner, deque())
+            in_use = self._gas_in_use.setdefault(owner, set())
             if pool:
-                return pool.pop()
-        # outside lock: refill
-        coins = self._rpc_get_gas_coins(owner, limit=50)
-        if not coins:
-            raise RuntimeError(f"No gas coins available for {owner}")
-        with self._gas_pool_lock:
-            # keep extras in pool
-            self._gas_pool.setdefault(owner, []).extend(coins[:-1])
-        return coins[-1]
+                coin = pool.pop()
+                in_use.add(coin)
+                return coin
+
+        # 2) Slow path: refill (serialize refills per owner)
+        refill_lock = self._get_refill_lock(owner)
+        with refill_lock:
+            # Re-check after waiting for refill lock
+            with self._gas_pool_lock:
+                pool = self._gas_pool.setdefault(owner, deque())
+                in_use = self._gas_in_use.setdefault(owner, set())
+                if pool:
+                    coin = pool.pop()
+                    in_use.add(coin)
+                    return coin
+
+            # Do the network call outside pool lock
+            self._gas_refill(owner, limit=500)
+
+        # 3) After refill attempt: wait briefly for coins to appear / return
+        deadline = time.time() + 2.0
+        while time.time() < deadline:
+            with self._gas_pool_lock:
+                pool = self._gas_pool.setdefault(owner, deque())
+                in_use = self._gas_in_use.setdefault(owner, set())
+                if pool:
+                    coin = pool.pop()
+                    in_use.add(coin)
+                    return coin
+            time.sleep(0.01)
+
+        # Try one faucet top-up and refill, then wait a bit longer
+        try:
+            self.request_gas(owner)
+        except Exception:
+            pass
+
+        self._gas_refill(owner, limit=200)
+
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            with self._gas_pool_lock:
+                pool = self._gas_pool.setdefault(owner, deque())
+                in_use = self._gas_in_use.setdefault(owner, set())
+                if pool:
+                    coin = pool.pop()
+                    in_use.add(coin)
+                    return coin
+            time.sleep(0.02)
+
+        raise RuntimeError(f"No gas coins available for {owner}")
 
     def _gas_release(self, owner: str, coin_id: str) -> None:
         if not coin_id:
             return
         with self._gas_pool_lock:
-            self._gas_pool.setdefault(owner, []).append(coin_id)
+            pool = self._gas_pool.setdefault(owner, deque())
+            in_use = self._gas_in_use.setdefault(owner, set())
+
+            # Remove from in-use; if it wasn't marked, still put it back safely
+            in_use.discard(coin_id)
+
+            # Avoid duplicates in pool
+            if coin_id not in pool:
+                pool.append(coin_id)
+
+    def _get_refill_lock(self, owner: str) -> threading.Lock:
+        with self._gas_pool_lock:
+            lk = self._gas_refill_lock.get(owner)
+            if lk is None:
+                lk = threading.Lock()
+                self._gas_refill_lock[owner] = lk
+            return lk
 
     def _delegate_respond_noninteractive(self, request_obj_id: str, simulate_work_hashes: int = 0) -> GasSummary:
-        # Read request state (object reads don't require sender, but still go through thread config)
         req_fields = self.fetch_object_fields(request_obj_id)
         assigned_delegate = _unwrap_sui_value(req_fields.get("assigned_delegate"))
         consumer_addr = _unwrap_sui_value(req_fields.get("consumer"))
@@ -1706,29 +1822,101 @@ class CTISharingProgram:
 
         encrypted_response_json = encrypt_for_public_key(consumer_account.public_key, cti_plain)
 
-        # IMPORTANT: keep benchmark stable by forcing file:// pointers.
-        # If you want to fully remove IPFS overhead, ensure ipfs_enabled=False during benchmarking.
+        # Force stable file:// pointer in benchmarks
         response_ref = self.upload_response_to_ipfs(encrypted_response_json, request_obj_id)
-        ref_arg = json.dumps(response_ref)
 
         delegate_addr = self.accounts[delegate_name].address
 
-        data, gas, raw = self._sui_call_json(
-            [
-                "sui", "client", "call",
-                "--package", self.package_id,
-                "--module", "cti",
-                "--function", "response_cti",
-                "--args", request_obj_id, ref_arg,
-                "--json",
-            ],
-            address=delegate_addr
+        resp, gas = self._rpc_move_call_commit(
+            signer=delegate_addr,
+            package_id=self.package_id,
+            module="cti",
+            function="response_cti",
+            args=[request_obj_id, response_ref],  # Move String, not json.dumps()
+            gas_budget="100000000",
         )
-        if not data:
-            raise RuntimeError("response_cti did not return JSON:\n" + raw[:1200])
+
+        if not isinstance(resp, dict) or not resp.get("effects"):
+            raise RuntimeError("response_cti RPC execution returned unexpected response")
 
         self._cache_invalidate(request_obj_id)
         return gas
+
+    def _pre_split_gas(self, owner: str, num_coins: int = 120, amount_each: int = 1_000_000_000):
+        """
+        Pre-split gas into many SUI coins.
+
+        - Preferred: 0x2::pay::split (single tx, amounts: vector<u64>)
+        - Fallback: 0x2::coin::split repeated (num_coins txs, amount: u64)
+
+        amount_each is in MIST (1e9 MIST = 1 SUI). Default: 1 SUI each.
+        """
+        print(f"Pre-splitting gas for {owner[:10]}... into {num_coins} coins")
+
+        # Grab coins and pick the largest as the source
+        coins = self._rpc_call("suix_getCoins", [owner, "0x2::sui::SUI", None, 50]).get("data") or []
+        if not coins:
+            raise RuntimeError("No gas coins found")
+
+        coins.sort(key=lambda c: int(c.get("balance", 0)), reverse=True)
+        base_coin = coins[0]["coinObjectId"]
+        base_bal = int(coins[0].get("balance", 0))
+
+        needed = int(num_coins) * int(amount_each)
+        if base_bal < needed:
+            raise RuntimeError(
+                f"Not enough balance in base coin to split: have {base_bal} mist, need {needed} mist "
+                f"({needed / 1e9:.2f} SUI)."
+            )
+
+        amounts = [int(amount_each)] * int(num_coins)
+
+        # ---- Preferred: pay::split (vector<u64>) ----
+        try:
+            self._rpc_move_call_commit(
+                signer=owner,
+                package_id="0x2",
+                module="pay",
+                function="split",
+                type_args=["0x2::sui::SUI"],
+                args=[base_coin, amounts],
+                gas_budget="500000000",
+            )
+            self._gas_refill(owner, limit=500)
+            print("Gas split complete via 0x2::pay::split.\n")
+            return
+        except Exception as e:
+            # If function is missing or signature differs, fall back
+            msg = str(e)
+            if "Could not resolve function" in msg or "resolve function" in msg or "Could not serialize argument" in msg:
+                print(f"pay::split not available/compatible, falling back to repeated coin::split. ({msg[:160]}...)\n")
+            else:
+                # Unexpected failure — still try fallback, but show full reason
+                print(f"pay::split failed; trying fallback coin::split. Reason: {msg}\n")
+
+        # ---- Fallback: coin::split (u64) repeated ----
+        for i in range(int(num_coins)):
+            self._rpc_move_call_commit(
+                signer=owner,
+                package_id="0x2",
+                module="coin",
+                function="split",
+                type_args=["0x2::sui::SUI"],
+                args=[base_coin, int(amount_each)],
+                gas_budget="200000000",
+            )
+
+            # After first split, re-select the largest coin again
+            # (the "base_coin" may change balance; this keeps it safe)
+            coins2 = self._rpc_call("suix_getCoins", [owner, "0x2::sui::SUI", None, 50]).get("data") or []
+            coins2.sort(key=lambda c: int(c.get("balance", 0)), reverse=True)
+            base_coin = coins2[0]["coinObjectId"]
+
+            if (i + 1) % 20 == 0:
+                print(f"  split progress: {i+1}/{num_coins}")
+
+        self._gas_refill(owner, limit=500)
+        print("Gas split complete via repeated 0x2::coin::split.\n")
 
     def _consumer_verify_noninteractive(self, request_obj_id: str) -> bool:
         req_fields = self.fetch_object_fields(request_obj_id)
@@ -1917,6 +2105,21 @@ class CTISharingProgram:
 
          # Benchmark should NOT include IPFS overhead in the hot path
         self.ipfs_enabled = False
+        consumer = self.accounts["consumer"].address
+        self._gas_refill(consumer, limit=500)
+        self._pre_split_gas(consumer, num_coins=120)
+        self._gas_refill(consumer, limit=200)
+        # Give each delegate enough gas coins for RPC response_cti during the benchmark
+        for i in range(4):
+            daddr = self.accounts[f"delegate_{i}"].address
+            self._gas_refill(daddr, limit=200)
+            self._pre_split_gas(daddr, num_coins=60)   # 60 is usually plenty; bump if you raise RPS/seconds/iterations
+            time.sleep(0.3)                            # let localnet index coin objects
+            self._gas_refill(daddr, limit=500)
+            with self._gas_pool_lock:
+                print(f"DEBUG: gas pool for delegate_{i} now has {len(self._gas_pool.get(daddr, []))} coins")
+        with self._gas_pool_lock:
+            print(f"DEBUG: gas pool for consumer now has {len(self._gas_pool.get(consumer, []))} coins")
 
         try:
             iterations = int(input("Iterations per (delegates,rps) point (paper used 100): ").strip() or "30")
@@ -2231,12 +2434,8 @@ class CTISharingProgram:
         gas_object: Optional[str] = None,
         gas_budget: str = "100000000",
     ):
-        """
-        Returns TransactionBlockBytes (dict) with txBytes (base64), gas, inputObjects.
-        Uses unsafe_moveCall builder on the node. :contentReference[oaicite:4]{index=4}
-        """
-        # Param order matches Sui JSON-RPC unsafe_moveCall: :contentReference[oaicite:5]{index=5}
-        # signer, package_object_id, module, function, type_arguments, arguments, gas, gas_budget, execution_mode
+        arguments = self._rpc_normalize_args(arguments)  # <-- ADD THIS LINE
+
         return self._rpc_call(
             "unsafe_moveCall",
             [
@@ -2246,9 +2445,9 @@ class CTISharingProgram:
                 function,
                 type_arguments or [],
                 arguments,
-                gas_object,      # None => node auto-select gas
+                gas_object,
                 gas_budget,
-                None,            # execution_mode None => Commit by default
+                None,
             ],
         )
     
@@ -2288,11 +2487,10 @@ class CTISharingProgram:
         1) unsafe_moveCall -> txBytes
         2) keytool sign    -> suiSignature
         3) execute         -> tx response
+        Uses a per-tx unique gas coin from the pool unless gas_object is provided.
         """
         owned_gas = None
-        if gas_object:
-            owned_gas = None  # caller provided one
-        else:
+        if gas_object is None:
             owned_gas = self._gas_acquire(signer)
             gas_object = owned_gas
 
@@ -2304,7 +2502,7 @@ class CTISharingProgram:
                 function=function,
                 type_arguments=type_args,
                 arguments=args,
-                gas_object=gas_object,     # <-- now always specific
+                gas_object=gas_object,   # ALWAYS specific now
                 gas_budget=gas_budget,
             )
 
@@ -2317,17 +2515,29 @@ class CTISharingProgram:
             return resp, _parse_gas_summary(resp)
 
         finally:
-            # release only if we acquired it
-            if owned_gas:
+            if owned_gas is not None:
                 self._gas_release(signer, owned_gas)
-        txb = tb.get("txBytes")
-        if not isinstance(txb, str) or not txb:
-            raise RuntimeError("unsafe_moveCall did not return txBytes:\n" + json.dumps(tb, indent=2)[:800])
 
-        sig = self._sign_txbytes_with_keytool(signer, txb)
-        resp = self._rpc_execute_tx(txb, sig)
-
-        return resp, _parse_gas_summary(resp)
+    def _rpc_normalize_args(self, x):
+        """
+        Sui JSON-RPC expects u64 values as STRINGS, not JSON numbers.
+        - int -> str
+        - list[int] that looks like bytes (0..255) -> keep ints (vector<u8>)
+        - list -> recurse
+        - dict -> recurse values
+        """
+        if isinstance(x, bool) or x is None:
+            return x
+        if isinstance(x, int):
+            return str(x)
+        if isinstance(x, list):
+            # keep likely vector<u8> as ints
+            if x and all(isinstance(v, int) and 0 <= v <= 255 for v in x):
+                return x
+            return [self._rpc_normalize_args(v) for v in x]
+        if isinstance(x, dict):
+            return {k: self._rpc_normalize_args(v) for k, v in x.items()}
+        return x
 
     # ---------------- run ----------------
 
