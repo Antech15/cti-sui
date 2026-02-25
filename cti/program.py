@@ -1642,30 +1642,35 @@ class CTISharingProgram:
     
     def _rpc_get_gas_coins(self, owner: str, limit: int = 200) -> List[str]:
         """
-        Return ALL SUI coinObjectIds for owner by paging suix_getCoins robustly.
+        Return ALL SUI coinObjectIds for owner by paging suix_getAllCoins,
+        then filtering to coinType == 0x2::sui::SUI.
 
-        Some nodes/localnet configs have quirky hasNextPage behavior; the most reliable
-        signal is nextCursor progression + non-empty pages.
+        This is more reliable than suix_getCoins on some localnet builds.
         """
         out: List[str] = []
         cursor = None
         seen: Set[str] = set()
 
         while True:
-            res = self._rpc_call("suix_getCoins", [owner, "0x2::sui::SUI", cursor, int(limit)])
+            # suix_getAllCoins(owner, cursor, limit)
+            res = self._rpc_call("suix_getAllCoins", [owner, cursor, int(limit)])
             data = res.get("data") or []
 
             for c in data:
                 cid = c.get("coinObjectId")
+                ctype = c.get("coinType")
+                if ctype != "0x2::sui::SUI":
+                    continue
                 if isinstance(cid, str) and cid.startswith("0x") and cid not in seen:
                     seen.add(cid)
                     out.append(cid)
 
+            has_next = bool(res.get("hasNextPage"))
             next_cursor = res.get("nextCursor")
 
-            # Stop if there's no next cursor OR the server returns an empty page
-            # OR cursor isn't progressing (safety against infinite loops).
             if not data:
+                break
+            if not has_next:
                 break
             if not next_cursor:
                 break
@@ -1778,6 +1783,19 @@ class CTISharingProgram:
                 lk = threading.Lock()
                 self._gas_refill_lock[owner] = lk
             return lk
+
+    def _try_delete_file_ref(self, ref: str) -> None:
+        if not isinstance(ref, str):
+            return
+        if not ref.startswith("file://"):
+            return
+        path = ref.replace("file://", "", 1)
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
 
     def _delegate_respond_noninteractive(self, request_obj_id: str, simulate_work_hashes: int = 0) -> GasSummary:
         req_fields = self.fetch_object_fields(request_obj_id)
@@ -1918,7 +1936,7 @@ class CTISharingProgram:
         self._gas_refill(owner, limit=500)
         print("Gas split complete via repeated 0x2::coin::split.\n")
 
-    def _consumer_verify_noninteractive(self, request_obj_id: str) -> bool:
+    def _consumer_verify_noninteractive(self, request_obj_id: str, *, delete_blob: bool = False) -> bool:
         req_fields = self.fetch_object_fields(request_obj_id)
         if not _unwrap_sui_value(req_fields.get("response_provided")):
             return False
@@ -1926,36 +1944,57 @@ class CTISharingProgram:
         cti_id = _unwrap_sui_value(req_fields.get("cti_id"))
         resp_nft_id = _unwrap_option_id(req_fields.get("encrypted_response_nft_id"))
 
-        encrypted_json = None
-        if resp_nft_id:
-            nft_fields = self.fetch_fields_any_object(resp_nft_id)
-            ref = _unwrap_sui_value(nft_fields.get("data"))
-            if not isinstance(ref, str):
-                return False
-            if ref.startswith("ipfs://"):
-                encrypted_json = self.ipfs_cat(ref)
-            elif ref.startswith("file://"):
-                path = ref.replace("file://", "")
-                with open(path, "r", encoding="utf-8") as f:
-                    encrypted_json = f.read()
+        encrypted_json: Optional[str] = None
+        ref: Optional[str] = None
+
+        try:
+            if resp_nft_id:
+                nft_fields = self.fetch_fields_any_object(resp_nft_id)
+                ref = _unwrap_sui_value(nft_fields.get("data"))
+                if not isinstance(ref, str) or not ref:
+                    return False
+
+                if ref.startswith("ipfs://"):
+                    encrypted_json = self.ipfs_cat(ref)
+
+                elif ref.startswith("file://"):
+                    path = ref.replace("file://", "", 1)
+                    with open(path, "r", encoding="utf-8") as f:
+                        encrypted_json = f.read()
+
+                else:
+                    return False
+
             else:
+                direct = _unwrap_sui_value(req_fields.get("encrypted_response"))
+                if isinstance(direct, str) and direct.strip():
+                    encrypted_json = direct
+                else:
+                    return False
+
+            if not isinstance(encrypted_json, str) or not encrypted_json.strip():
                 return False
-        else:
-            direct = _unwrap_sui_value(req_fields.get("encrypted_response"))
-            if isinstance(direct, str) and direct.strip():
-                encrypted_json = direct
-            else:
+
+            plaintext = self.accounts["consumer"].decrypt_payload(encrypted_json)
+            local_hash = hashlib.sha256(plaintext).digest()
+
+            cti_fields = self.fetch_object_fields(cti_id)
+            on_chain_hash = cti_fields.get("cti_hash")
+            if not isinstance(on_chain_hash, list):
                 return False
 
-        plaintext = self.accounts["consumer"].decrypt_payload(encrypted_json)
-        local_hash = hashlib.sha256(plaintext).digest()
+            return (local_hash == bytes(on_chain_hash))
 
-        cti_fields = self.fetch_object_fields(cti_id)
-        on_chain_hash = cti_fields.get("cti_hash")
-        if not isinstance(on_chain_hash, list):
-            return False
-
-        return local_hash == bytes(on_chain_hash)
+        finally:
+            # Only delete if explicitly requested
+            if delete_blob and isinstance(ref, str) and ref.startswith("file://"):
+                path = ref.replace("file://", "", 1)
+                try:
+                    os.remove(path)
+                except FileNotFoundError:
+                    pass
+                except Exception:
+                    pass
 
     def _add_delegate_noninteractive(self, cti_id: str, request_obj_id: str) -> GasSummary:
         consumer_addr = self.accounts["consumer"].address
@@ -2025,6 +2064,53 @@ class CTISharingProgram:
         plt.tight_layout()
         plt.savefig(os.path.join("bench_outputs", "fig6.png"), dpi=200)
         plt.close(fig)
+
+    def _ensure_gas_coins(self, owner: str, target_coins: int, *, do_faucet: bool = True) -> None:
+        """
+        Ensure the owner's gas pool has at least `target_coins` available coins.
+
+        Strategy:
+        1) refill pool from RPC coin list
+        2) if still short, optionally call faucet once, refill again
+        3) if still short, split ONLY the missing number of coins (not a big fixed number)
+        """
+        target_coins = max(0, int(target_coins))
+
+        # Step 1: refill
+        self._gas_refill(owner, limit=500)
+        with self._gas_pool_lock:
+            have = len(self._gas_pool.get(owner, []))
+
+        if have >= target_coins:
+            print(f"Gas pool already has {have} coins for {owner[:10]}... (target={target_coins}), skipping split.\n")
+            return
+
+        missing = target_coins - have
+        print(f"Gas pool has {have} coins for {owner[:10]}... (target={target_coins}), missing={missing}")
+
+        # Step 2: optional faucet top-up (often fast on localnet)
+        if do_faucet:
+            try:
+                self.request_gas(owner)
+            except Exception:
+                pass
+            self._gas_refill(owner, limit=500)
+            with self._gas_pool_lock:
+                have2 = len(self._gas_pool.get(owner, []))
+            if have2 >= target_coins:
+                print(f"Faucet+refill brought pool to {have2} coins, skipping split.\n")
+                return
+            missing = target_coins - have2
+            print(f"After faucet+refill: have={have2}, still missing={missing}")
+
+        # Step 3: split ONLY what we still need
+        # (This is what saves you minutes.)
+        self._pre_split_gas(owner, num_coins=missing)
+        self._gas_refill(owner, limit=500)
+
+        with self._gas_pool_lock:
+            final_have = len(self._gas_pool.get(owner, []))
+        print(f"Final gas pool for {owner[:10]}... now has {final_have} coins (target={target_coins}).\n")
 
     def _render_table1(self, cost_rows: List[dict]):
         xs = [float(r["delegate_count"]) for r in cost_rows]
@@ -2101,278 +2187,296 @@ class CTISharingProgram:
         plt.close(fig)
 
     def run_benchmarks_paper_style(self):
-        os.makedirs("bench_outputs", exist_ok=True)
+        def _fmt_seconds(s: float) -> str:
+            s = max(0, int(round(s)))
+            h = s // 3600
+            m = (s % 3600) // 60
+            sec = s % 60
+            if h > 0:
+                return f"{h:d}h {m:02d}m {sec:02d}s"
+            if m > 0:
+                return f"{m:d}m {sec:02d}s"
+            return f"{sec:d}s"
 
-         # Benchmark should NOT include IPFS overhead in the hot path
-        self.ipfs_enabled = False
-        consumer = self.accounts["consumer"].address
-        self._gas_refill(consumer, limit=500)
-        self._pre_split_gas(consumer, num_coins=120)
-        self._gas_refill(consumer, limit=200)
-        # Give each delegate enough gas coins for RPC response_cti during the benchmark
-        for i in range(4):
-            daddr = self.accounts[f"delegate_{i}"].address
-            self._gas_refill(daddr, limit=200)
-            self._pre_split_gas(daddr, num_coins=60)   # 60 is usually plenty; bump if you raise RPS/seconds/iterations
-            time.sleep(0.3)                            # let localnet index coin objects
-            self._gas_refill(daddr, limit=500)
+        bench_t0_wall = time.time()
+        bench_t0 = time.perf_counter()
+        print(f"\n⏱️  Benchmark started at {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(bench_t0_wall))}\n")
+
+        try:
+            os.makedirs("bench_outputs", exist_ok=True)
+
+            # Benchmark should NOT include IPFS overhead in the hot path
+            self.ipfs_enabled = False
+
+            # ---- Ask benchmark parameters FIRST (so we can size gas coins correctly) ----
+            try:
+                iterations = int(input("Iterations per (delegates,rps) point (paper used 100): ").strip() or "30")
+            except ValueError:
+                iterations = 30
+            try:
+                seconds = int(input("Seconds per iteration window (paper used 90): ").strip() or "15")
+            except ValueError:
+                seconds = 15
+            try:
+                max_rps = int(input("Max request rate per second (paper used 11): ").strip() or "11")
+            except ValueError:
+                max_rps = 11
+            try:
+                simulate_work = int(input("Simulated off-chain hash ops per request (0=off, paper used 100000): ").strip() or "0")
+            except ValueError:
+                simulate_work = 0
+
+            # ---- GAS COIN SIZING (reduce splits massively) ----
+            #
+            # Consumer stage A does 2 tx per request (request_cti + credentials_cti).
+            # You cap REQ_WORKERS in your loop to <= 16, so concurrency is bounded.
+            #
+            # Delegates stage B concurrency is dn (1..4), so each delegate needs only a small cushion.
+            #
+            # These targets are intentionally modest but safe for your current code structure.
+            REQ_WORKERS_CAP = 16
+            consumer_target = 2 * REQ_WORKERS_CAP + 12   # ~44 coins is plenty vs 120
+            delegate_target = 12                         # vs 60; enough for dn<=4 + bursts
+
+            consumer = self.accounts["consumer"].address
+
+            # Ensure consumer pool has enough coins (skip splitting if already sufficient)
+            self._ensure_gas_coins(consumer, consumer_target, do_faucet=True)
+
+            # Ensure each delegate has enough coins (skip splitting if already sufficient)
+            for i in range(4):
+                daddr = self.accounts[f"delegate_{i}"].address
+                self._ensure_gas_coins(daddr, delegate_target, do_faucet=True)
+                time.sleep(0.15)  # small delay to let localnet index new coins
+
             with self._gas_pool_lock:
-                print(f"DEBUG: gas pool for delegate_{i} now has {len(self._gas_pool.get(daddr, []))} coins")
-        with self._gas_pool_lock:
-            print(f"DEBUG: gas pool for consumer now has {len(self._gas_pool.get(consumer, []))} coins")
+                for i in range(4):
+                    daddr = self.accounts[f"delegate_{i}"].address
+                    print(f"DEBUG: gas pool for delegate_{i} now has {len(self._gas_pool.get(daddr, []))} coins")
+                print(f"DEBUG: gas pool for consumer now has {len(self._gas_pool.get(consumer, []))} coins")
 
-        try:
-            iterations = int(input("Iterations per (delegates,rps) point (paper used 100): ").strip() or "30")
-        except ValueError:
-            iterations = 30
-        try:
-            seconds = int(input("Seconds per iteration window (paper used 90): ").strip() or "15")
-        except ValueError:
-            seconds = 15
-        try:
-            max_rps = int(input("Max request rate per second (paper used 11): ").strip() or "11")
-        except ValueError:
-            max_rps = 11
-        try:
-            simulate_work = int(input("Simulated off-chain hash ops per request (0=off, paper used 100000): ").strip() or "0")
-        except ValueError:
-            simulate_work = 0
+            payload = b'{"bench":"cti","msg":"hello"}'
 
-        payload = b'{"bench":"cti","msg":"hello"}'
+            # ---- COSTS (DN=0..4) ----
+            cost_rows = []
+            print("\n--- Computing gas cost rows (DN=0..4) ---")
+            for dn in range(0, 5):
+                print(f"Creating cost row for delegates={dn}")
+                cti_id, gas_share = self._create_cti_noninteractive(dn, payload, acmp_num=2)
+                row = {
+                    "delegate_count": dn,
+                    "share_net": gas_share.net,
+                    "request_step4_net": 0,
+                    "request_step6_net": 0,
+                    "response_step10_net": 0,
+                    "delegate_step13_net": 0,
+                }
+                if dn >= 1:
+                    req_id, _, gas4, gas6 = self._request_and_credentials(cti_id, credentials_text="andres")
+                    gas10 = self._delegate_respond_noninteractive(req_id, simulate_work_hashes=simulate_work)
 
-        # ---- COSTS (DN=0..4) ----
-        cost_rows = []
-        print("\n--- Computing gas cost rows (DN=0..4) ---")
-        for dn in range(0, 5):
-            print(f"Creating cost row for delegates={dn}")
-            cti_id, gas_share = self._create_cti_noninteractive(dn, payload, acmp_num=2)
-            row = {
-                "delegate_count": dn,
-                "share_net": gas_share.net,
-                "request_step4_net": 0,
-                "request_step6_net": 0,
-                "response_step10_net": 0,
-                "delegate_step13_net": 0,
+                    # IMPORTANT: do NOT delete the response file yet; Step 13 needs it.
+                    _ = self._consumer_verify_noninteractive(req_id, delete_blob=False)
+
+                    gas13 = self._add_delegate_noninteractive(cti_id, req_id)
+
+                    # Now it's safe to delete it (optional cleanup)
+                    _ = self._consumer_verify_noninteractive(req_id, delete_blob=True)
+
+                    row["request_step4_net"] = gas4.net
+                    row["request_step6_net"] = gas6.net
+                    row["response_step10_net"] = gas10.net
+                    row["delegate_step13_net"] = gas13.net
+                cost_rows.append(row)
+
+            # ---- FIG6 points (DN=1..4, rps=1..max) ----
+            fig6_points: Dict[Tuple[int, int], List[float]] = {}
+
+            for dn in range(1, 5):
+                cti_id, _ = self._create_cti_noninteractive(dn, payload, acmp_num=2)
+
+                for rps in range(1, max_rps + 1):
+                    rates = []
+
+                    for _it in range(iterations):
+                        start = time.time()
+                        end = start + seconds
+                        next_tick = start
+
+                        attempted = ok = fail_req = fail_resp = fail_verify = 0
+                        printed_first_fail_req = False
+
+                        MAX_INFLIGHT = max(20, rps * 5)
+                        REQ_WORKERS  = min(REQ_WORKERS_CAP, max(4, rps * 2))
+                        VER_WORKERS  = 4
+
+                        with ThreadPoolExecutor(max_workers=REQ_WORKERS) as ex_req, \
+                            ThreadPoolExecutor(max_workers=dn) as ex_resp, \
+                            ThreadPoolExecutor(max_workers=VER_WORKERS) as ex_ver:
+
+                            req_futs: List[object] = []
+                            resp_futs: List[Tuple[object, str]] = []
+                            ver_futs: List[Tuple[object, str]] = []
+
+                            def _stageA_request_and_creds():
+                                req_id, _, _, _ = self._request_and_credentials(cti_id, credentials_text="andres")
+                                return req_id
+
+                            while True:
+                                now = time.time()
+                                if now >= end:
+                                    break
+
+                                if now >= next_tick:
+                                    while now >= next_tick and now < end:
+                                        next_tick += 1.0 / max(1, rps)
+
+                                        if len(req_futs) < MAX_INFLIGHT:
+                                            attempted += 1
+                                            req_futs.append(ex_req.submit(_stageA_request_and_creds))
+                                        now = time.time()
+                                else:
+                                    time.sleep(min(0.002, max(0.0, next_tick - now)))
+
+                                # Stage A -> Stage B
+                                new_req_futs = []
+                                for f in req_futs:
+                                    if not f.done():
+                                        new_req_futs.append(f)
+                                        continue
+                                    try:
+                                        req_id = f.result()
+                                    except Exception as e:
+                                        fail_req += 1
+                                        if not printed_first_fail_req:
+                                            printed_first_fail_req = True
+                                            print("First fail_req error:", repr(e))
+                                        continue
+
+                                    rf = ex_resp.submit(self._delegate_respond_noninteractive, req_id, simulate_work_hashes=simulate_work)
+                                    resp_futs.append((rf, req_id))
+                                req_futs = new_req_futs
+
+                                # Stage B -> Stage C
+                                new_resp_futs = []
+                                for rf, req_id in resp_futs:
+                                    if not rf.done():
+                                        new_resp_futs.append((rf, req_id))
+                                        continue
+                                    try:
+                                        _ = rf.result()
+                                    except Exception:
+                                        fail_resp += 1
+                                        continue
+
+                                    vf = ex_ver.submit(self._consumer_verify_noninteractive, req_id, delete_blob=True)
+                                    ver_futs.append((vf, req_id))
+                                resp_futs = new_resp_futs
+
+                                # Stage C harvest
+                                new_ver_futs = []
+                                for vf, req_id in ver_futs:
+                                    if not vf.done():
+                                        new_ver_futs.append((vf, req_id))
+                                        continue
+                                    try:
+                                        if vf.result():
+                                            ok += 1
+                                        else:
+                                            fail_verify += 1
+                                    except Exception:
+                                        fail_verify += 1
+                                ver_futs = new_ver_futs
+
+                            # Grace period
+                            grace_end = time.time() + 1.0
+                            while time.time() < grace_end and (req_futs or resp_futs or ver_futs):
+                                new_req_futs = []
+                                for f in req_futs:
+                                    if not f.done():
+                                        new_req_futs.append(f)
+                                        continue
+                                    try:
+                                        req_id = f.result()
+                                    except Exception as e:
+                                        fail_req += 1
+                                        if not printed_first_fail_req:
+                                            printed_first_fail_req = True
+                                            print("First fail_req error (grace):", repr(e))
+                                        continue
+                                    rf = ex_resp.submit(self._delegate_respond_noninteractive, req_id, simulate_work_hashes=simulate_work)
+                                    resp_futs.append((rf, req_id))
+                                req_futs = new_req_futs
+
+                                new_resp_futs = []
+                                for rf, req_id in resp_futs:
+                                    if not rf.done():
+                                        new_resp_futs.append((rf, req_id))
+                                        continue
+                                    try:
+                                        _ = rf.result()
+                                    except Exception:
+                                        fail_resp += 1
+                                        continue
+                                    vf = ex_ver.submit(self._consumer_verify_noninteractive, req_id, delete_blob=True)
+                                    ver_futs.append((vf, req_id))
+                                resp_futs = new_resp_futs
+
+                                new_ver_futs = []
+                                for vf, req_id in ver_futs:
+                                    if not vf.done():
+                                        new_ver_futs.append((vf, req_id))
+                                        continue
+                                    try:
+                                        if vf.result():
+                                            ok += 1
+                                        else:
+                                            fail_verify += 1
+                                    except Exception:
+                                        fail_verify += 1
+                                ver_futs = new_ver_futs
+
+                                time.sleep(0.01)
+
+                        rate = ok / max(1e-9, float(seconds))
+                        print(
+                            f"[dn={dn} rps={rps} it={_it}] "
+                            f"attempted={attempted} target~={rps*seconds} ok={ok} "
+                            f"fail_req={fail_req} fail_resp={fail_resp} fail_verify={fail_verify} "
+                            f"resp/s={rate:.2f}"
+                        )
+                        rates.append(rate)
+
+                    fig6_points[(dn, rps)] = rates
+                    m, s = _mean_std(rates)
+                    print(f"delegates={dn} rps={rps} mean_resp/s={m:.2f} std={s:.2f}")
+
+            raw = {
+                "iterations": iterations,
+                "seconds": seconds,
+                "max_rps": max_rps,
+                "simulate_work_hashes": simulate_work,
+                "cost_rows": cost_rows,
+                "fig6_points": {f"{dn},{rps}": rates for (dn, rps), rates in fig6_points.items()},
             }
-            if dn >= 1:
-                req_id, _, gas4, gas6 = self._request_and_credentials(cti_id, credentials_text="andres")
-                gas10 = self._delegate_respond_noninteractive(req_id, simulate_work_hashes=simulate_work)
-                _ = self._consumer_verify_noninteractive(req_id)
-                gas13 = self._add_delegate_noninteractive(cti_id, req_id)
-                row["request_step4_net"] = gas4.net
-                row["request_step6_net"] = gas6.net
-                row["response_step10_net"] = gas10.net
-                row["delegate_step13_net"] = gas13.net
-            cost_rows.append(row)
+            with open(os.path.join("bench_outputs", "raw_results.json"), "w", encoding="utf-8") as f:
+                json.dump(raw, f, indent=2)
 
-        # ---- FIG6 points (DN=1..4, rps=1..max) ----
-        fig6_points: Dict[Tuple[int, int], List[float]] = {}
+            self._plot_fig6(fig6_points, max_rps)
+            self._render_table1(cost_rows)
+            self._plot_fig7(cost_rows, fig6_points, max_rps)
 
-        for dn in range(1, 5):
-            cti_id, _ = self._create_cti_noninteractive(dn, payload, acmp_num=2)
+            print("\n✅ Generated:")
+            print("  bench_outputs/fig6.png")
+            print("  bench_outputs/table1.png")
+            print("  bench_outputs/fig7.png")
+            print("  bench_outputs/raw_results.json\n")
 
-            for rps in range(1, max_rps + 1):
-                rates = []
-
-                for _it in range(iterations):
-                    start = time.time()
-                    end = start + seconds
-                    next_tick = start
-
-                    attempted = ok = fail_req = fail_resp = fail_verify = 0
-                    printed_first_fail_req = False
-
-                    # Keep these modest; you can bump later.
-                    MAX_INFLIGHT = max(20, rps * 5)          # cap outstanding "request+cred" tasks
-                    REQ_WORKERS  = min(16, max(4, rps * 2))  # stage A (consumer request+cred)
-                    VER_WORKERS  = 4                         # stage C (verify)
-
-                    # Stage executors:
-                    # - ex_req handles Step 4 + Step 6 (consumer) concurrently
-                    # - ex_resp handles Step 10 (delegate response)
-                    # - ex_ver handles Steps 11/12 verify
-                    with ThreadPoolExecutor(max_workers=REQ_WORKERS) as ex_req, \
-                        ThreadPoolExecutor(max_workers=dn) as ex_resp, \
-                        ThreadPoolExecutor(max_workers=VER_WORKERS) as ex_ver:
-
-                        # Futures:
-                        req_futs: List[object] = []                 # future -> (request_obj_id) or raises
-                        resp_futs: List[Tuple[object, str]] = []    # (future, request_obj_id)
-                        ver_futs: List[Tuple[object, str]] = []     # (future, request_obj_id)
-
-                        def _stageA_request_and_creds():
-                            # returns request_obj_id
-                            req_id, _, _, _ = self._request_and_credentials(cti_id, credentials_text="andres")
-                            return req_id
-
-                        # Main fixed-rate scheduler loop
-                        while True:
-                            now = time.time()
-                            if now >= end:
-                                break
-
-                            # ---- 1) schedule new "attempts" at fixed rate, WITHOUT blocking ----
-                            if now >= next_tick:
-                                # schedule as many ticks as we missed (important if we got delayed)
-                                while now >= next_tick and now < end:
-                                    next_tick += 1.0 / max(1, rps)
-
-                                    # Respect inflight cap (prevents runaway memory/queueing)
-                                    if len(req_futs) < MAX_INFLIGHT:
-                                        attempted += 1
-                                        req_futs.append(ex_req.submit(_stageA_request_and_creds))
-                                    else:
-                                        # Can't enqueue more right now; count as attempted but failed-to-schedule?
-                                        # Easiest: just skip scheduling until backlog clears.
-                                        pass
-
-                                    now = time.time()
-                            else:
-                                # Small sleep to avoid busy spin
-                                time.sleep(min(0.002, max(0.0, next_tick - now)))
-
-                            # ---- 2) harvest finished Stage A -> enqueue Stage B ----
-                            new_req_futs = []
-                            for f in req_futs:
-                                if not f.done():
-                                    new_req_futs.append(f)
-                                    continue
-                                try:
-                                    req_id = f.result()
-                                except Exception as e:
-                                    fail_req += 1
-                                    if not printed_first_fail_req:
-                                        printed_first_fail_req = True
-                                        print("First fail_req error:", repr(e))
-                                    continue
-
-                                # Enqueue delegate response (Step 10) concurrently
-                                rf = ex_resp.submit(self._delegate_respond_noninteractive, req_id, simulate_work_hashes=simulate_work)
-                                resp_futs.append((rf, req_id))
-
-                            req_futs = new_req_futs
-
-                            # ---- 3) harvest finished Stage B -> enqueue Stage C ----
-                            new_resp_futs = []
-                            for rf, req_id in resp_futs:
-                                if not rf.done():
-                                    new_resp_futs.append((rf, req_id))
-                                    continue
-                                try:
-                                    _ = rf.result()
-                                except Exception:
-                                    fail_resp += 1
-                                    continue
-
-                                vf = ex_ver.submit(self._consumer_verify_noninteractive, req_id)
-                                ver_futs.append((vf, req_id))
-
-                            resp_futs = new_resp_futs
-
-                            # ---- 4) harvest finished Stage C ----
-                            new_ver_futs = []
-                            for vf, req_id in ver_futs:
-                                if not vf.done():
-                                    new_ver_futs.append((vf, req_id))
-                                    continue
-                                try:
-                                    if vf.result():
-                                        ok += 1
-                                    else:
-                                        fail_verify += 1
-                                except Exception:
-                                    fail_verify += 1
-
-                            ver_futs = new_ver_futs
-
-                        # Optional grace period: finish backlog a bit (keeps more fair “ok” count)
-                        grace_end = time.time() + 1.0
-                        while time.time() < grace_end and (req_futs or resp_futs or ver_futs):
-                            # Drain Stage A
-                            new_req_futs = []
-                            for f in req_futs:
-                                if not f.done():
-                                    new_req_futs.append(f)
-                                    continue
-                                try:
-                                    req_id = f.result()
-                                except Exception as e:
-                                    fail_req += 1
-                                    if not printed_first_fail_req:
-                                        printed_first_fail_req = True
-                                        print("First fail_req error (grace):", repr(e))
-                                    continue
-                                rf = ex_resp.submit(self._delegate_respond_noninteractive, req_id, simulate_work_hashes=simulate_work)
-                                resp_futs.append((rf, req_id))
-                            req_futs = new_req_futs
-
-                            # Drain Stage B
-                            new_resp_futs = []
-                            for rf, req_id in resp_futs:
-                                if not rf.done():
-                                    new_resp_futs.append((rf, req_id))
-                                    continue
-                                try:
-                                    _ = rf.result()
-                                except Exception:
-                                    fail_resp += 1
-                                    continue
-                                vf = ex_ver.submit(self._consumer_verify_noninteractive, req_id)
-                                ver_futs.append((vf, req_id))
-                            resp_futs = new_resp_futs
-
-                            # Drain Stage C
-                            new_ver_futs = []
-                            for vf, req_id in ver_futs:
-                                if not vf.done():
-                                    new_ver_futs.append((vf, req_id))
-                                    continue
-                                try:
-                                    if vf.result():
-                                        ok += 1
-                                    else:
-                                        fail_verify += 1
-                                except Exception:
-                                    fail_verify += 1
-                            ver_futs = new_ver_futs
-
-                            time.sleep(0.01)
-
-                    # IMPORTANT: compute throughput vs the *window seconds*, not (wall_time + grace)
-                    rate = ok / max(1e-9, float(seconds))
-
-                    print(
-                        f"[dn={dn} rps={rps} it={_it}] "
-                        f"attempted={attempted} target~={rps*seconds} ok={ok} "
-                        f"fail_req={fail_req} fail_resp={fail_resp} fail_verify={fail_verify} "
-                        f"resp/s={rate:.2f}"
-                    )
-                    rates.append(rate)
-
-                fig6_points[(dn, rps)] = rates
-                m, s = _mean_std(rates)
-                print(f"delegates={dn} rps={rps} mean_resp/s={m:.2f} std={s:.2f}")
-
-        raw = {
-            "iterations": iterations,
-            "seconds": seconds,
-            "max_rps": max_rps,
-            "simulate_work_hashes": simulate_work,
-            "cost_rows": cost_rows,
-            "fig6_points": {f"{dn},{rps}": rates for (dn, rps), rates in fig6_points.items()},
-        }
-        with open(os.path.join("bench_outputs", "raw_results.json"), "w", encoding="utf-8") as f:
-            json.dump(raw, f, indent=2)
-
-        self._plot_fig6(fig6_points, max_rps)
-        self._render_table1(cost_rows)
-        self._plot_fig7(cost_rows, fig6_points, max_rps)
-
-        print("\n✅ Generated:")
-        print("  bench_outputs/fig6.png")
-        print("  bench_outputs/table1.png")
-        print("  bench_outputs/fig7.png")
-        print("  bench_outputs/raw_results.json\n")
+        finally:
+            bench_dt = time.perf_counter() - bench_t0
+            bench_t1_wall = time.time()
+            print(f"\n⏱️  Benchmark finished at {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(bench_t1_wall))}")
+            print(f"⏱️  Total benchmark time: {_fmt_seconds(bench_dt)} ({bench_dt:.2f} seconds)\n")
 
     def _rpc_call(self, method: str, params: list):
         with self._rpc_id_lock:
