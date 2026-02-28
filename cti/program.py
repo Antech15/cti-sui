@@ -2503,14 +2503,17 @@ class CTISharingProgram:
         """
         Returns a Sui signature string for sui_executeTransactionBlock.
         Thread-safe: keytool/keystore access is serialized.
-        Uses this thread's SUI_CONFIG_DIR so threads don't fight.
+        IMPORTANT: Use the BASE SUI_CONFIG_DIR to avoid creating sui_cfg_* temp dirs.
         """
+        env = os.environ.copy()
+        env["SUI_CONFIG_DIR"] = self._base_sui_config_dir
+
         with self._keytool_lock:
             r = subprocess.run(
                 ["sui", "keytool", "sign", "--address", address, "--data", tx_bytes_b64, "--json"],
                 capture_output=True,
                 text=True,
-                env=self._sui_env(),  # <-- IMPORTANT: thread-local config dir
+                env=env,
             )
 
         if r.returncode != 0:
