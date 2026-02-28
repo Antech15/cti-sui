@@ -2178,7 +2178,7 @@ class CTISharingProgram:
         ax1.legend(loc="upper left")
 
         ax2 = ax1.twinx()
-        ax2.plot(x, mrps, marker="s", linewidth=1, label="Scalability (MRPS)")
+        ax2.plot(x, mrps, marker="s", linewidth=1, color="green", label="Scalability (MRPS)")
         ax2.set_ylabel("Scalability (MRPS)")
         ax2.legend(loc="upper right")
 
